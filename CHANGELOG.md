@@ -4,10 +4,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/) and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ## [Unreleased]
+### Added
+### Changed
 ### Fixed
-- Kernel - Fix long rename BSOD with network option enabled
-- Library - Use `DbgPrintW` instead of `DbgPrint` when printing wide characters
-- Library - Add error check for `_vscprintf` and `vsprintf_s` in `DokanDbgPrint`, and `_vscwprintf` and `vswprintf_s` in `DokanDbgPrintW`
+
+## [1.3.0.1000] - 2019-07-24
+### Added
+- Mirror - Use `GetDiskFreeSpace` during `MirrorDokanGetDiskFreeSpace`.
+- Kernel - Add most important log msg to Event Viewer.
+- Kernel - Add `DOKAN_OPTION_DISABLE_OPLOCKS` dokan option.
+- Kernel - Add check that `DeviceControl` are performed on a volume handle and not a file.
+- Kernel - Add `DOKAN_OPTION_OPTIMIZE_SINGLE_NAME_SEARCH` dokan option to speedup Win7 file name normalization.
+- Library - Add functions to notify Dokan Kernel that files in use fs has changed `DokanNotifyCreate / DokanNotifyDelete / DokanNotifyUpdate / DokanNotifyXAttrUpdate / DokanNotifyRename`.
+- SetAssemblyVersion - Now update `DOKAN_MAJOR_API_VERSION`.
+- Kernel - Write - Check total event length is not longer than what we can allocate.
+
+### Changed
+- Use latest WDK & SDK for Windows 10 version 1903 and toolset v142.
+- Installer - Update VCRedistVersion to VS 2019 14.21.27702.
+- Mirror - Improve ShowUsage.
+- Library - `DokanGetMountPointList` now returns his own buffer that need to be released with `DokanReleaseMountPointList`.
+- Kernel - Return proper error status for `DFileSystemControl`.
+- Kernel - Fix OpLocks / Remove FCB Retry lock.
+- Kernel - Use debug mode option to enable lock or/and oplock kernel log.
+- Kernel - Rename `DOKAN_KEEPALIVE_TIMEOUT` to `DOKAN_KEEPALIVE_TIMEOUT_DEFAULT`
+
+### Fixed
+- Kernel - Fix long rename BSOD with network option enabled.
+- Kernel - Fix root rename with 360 antivirus.
+- Library - Use `DbgPrintW` instead of `DbgPrint` when printing wide characters.
+- Library - Add error check for `_vscprintf` and `vsprintf_s` in `DokanDbgPrint`, and `_vscwprintf` and `vswprintf_s` in `DokanDbgPrintW`.
+- Library - Fix `DokanUnmount` possible oob memory.
+- Mirror - Fix possible oob memory during long findfiles path.
+- Mirror - Fix possible oob memory during long DeleteDirectory path.
+- Kernel - Lock global resources during `DokanGetMountPointList` avoid possible BSOD.
+- Kernel - Send correct notify change during `FileRenameInformation` when move to a diff folder.
+- Kernel - Move all `Io ShareAccess` under fcb RW lock.
+- Dokannp - Add leading `\` to `UNCName` during `NPGetConnection`.
 
 ## [1.2.2.1000] - 2019-03-08
 ### Added

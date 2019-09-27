@@ -1368,7 +1368,6 @@ static NTSTATUS DOKAN_CALLBACK MirrorGetVolumeInformation(
   return STATUS_SUCCESS;
 }
 
-
 // Uncomment the function and set dokanOperations->GetDiskFreeSpace to personalize disk space
 /*
 static NTSTATUS DOKAN_CALLBACK MirrorDokanGetDiskFreeSpace(
@@ -1383,6 +1382,29 @@ static NTSTATUS DOKAN_CALLBACK MirrorDokanGetDiskFreeSpace(
   return STATUS_SUCCESS;
 }
 */
+
+static NTSTATUS DOKAN_CALLBACK MirrorDokanGetDiskFreeSpace(
+    PULONGLONG FreeBytesAvailable, PULONGLONG TotalNumberOfBytes,
+    PULONGLONG TotalNumberOfFreeBytes, PDOKAN_FILE_INFO DokanFileInfo) {
+  UNREFERENCED_PARAMETER(DokanFileInfo);
+
+  DWORD SectorsPerCluster;
+  DWORD BytesPerSector;
+  DWORD NumberOfFreeClusters;
+  DWORD TotalNumberOfClusters;
+  WCHAR DriveLetter[3] = {'C', ':', 0};
+  DriveLetter[0] = RootDirectory[0];
+
+  GetDiskFreeSpace(DriveLetter, &SectorsPerCluster, &BytesPerSector,
+                   &NumberOfFreeClusters, &TotalNumberOfClusters);
+  *FreeBytesAvailable =
+      ((ULONGLONG)SectorsPerCluster) * BytesPerSector * NumberOfFreeClusters;
+  *TotalNumberOfFreeBytes =
+      ((ULONGLONG)SectorsPerCluster) * BytesPerSector * NumberOfFreeClusters;
+  *TotalNumberOfBytes =
+      ((ULONGLONG)SectorsPerCluster) * BytesPerSector * TotalNumberOfClusters;
+  return STATUS_SUCCESS;
+}
 
 /**
  * Avoid #include <winternl.h> which as conflict with FILE_INFORMATION_CLASS
@@ -1488,7 +1510,7 @@ BOOL WINAPI CtrlHandler(DWORD dwCtrlType) {
 
 void ShowUsage() {
   // clang-format off
-  fprintf(stderr, "mirror.exe\n"
+  fprintf(stderr, "mirror.exe - Mirror a local device or folder to secondary device, an NTFS folder or a network device.\n"
           "  /r RootDirectory (ex. /r c:\\test)\t\t Directory source to mirror.\n"
           "  /l MountPoint (ex. /l m)\t\t\t Mount point. Can be M:\\ (drive letter) or empty NTFS folder C:\\mount\\dokan .\n"
           "  /t ThreadCount (ex. /t 5)\t\t\t Number of threads to be used internally by Dokan library.\n\t\t\t\t\t\t More threads will handle more event at the same time.\n"
@@ -1504,7 +1526,9 @@ void ShowUsage() {
           "  /a Allocation unit size (ex. /a 512)\t\t Allocation Unit Size of the volume. This will behave on the disk file size.\n"
           "  /k Sector size (ex. /k 512)\t\t\t Sector Size of the volume. This will behave on the disk file size.\n"
           "  /f User mode Lock\t\t\t\t Enable Lockfile/Unlockfile operations. Otherwise Dokan will take care of it.\n"
-          "  /i (Timeout in Milliseconds ex. /i 30000)\t Timeout until a running operation is aborted and the device is unmounted.\n\n"
+          "  /e Disable OpLocks\t\t\t\t Disable OpLocks kernel operations. Otherwise Dokan will take care of it.\n"
+          "  /i (Timeout in Milliseconds ex. /i 30000)\t Timeout until a running operation is aborted and the device is unmounted.\n"
+          "  /z Optimize single name search\t\t Speed up directory query under Windows 7.\n\n"
           "Examples:\n"
           "\tmirror.exe /r C:\\Users /l M:\t\t\t# Mirror C:\\Users as RootDirectory into a drive of letter M:\\.\n"
           "\tmirror.exe /r C:\\Users /l C:\\mount\\dokan\t# Mirror C:\\Users as RootDirectory into NTFS folder C:\\mount\\dokan.\n"
@@ -1581,6 +1605,12 @@ int __cdecl wmain(ULONG argc, PWCHAR argv[]) {
       break;
     case L'f':
       dokanOptions->Options |= DOKAN_OPTION_FILELOCK_USER_MODE;
+      break;
+    case L'e':
+      dokanOptions->Options |= DOKAN_OPTION_DISABLE_OPLOCKS;
+      break;
+    case L'z':
+      dokanOptions->Options |= DOKAN_OPTION_OPTIMIZE_SINGLE_NAME_SEARCH;
       break;
     case L'u':
       command++;
@@ -1696,7 +1726,7 @@ int __cdecl wmain(ULONG argc, PWCHAR argv[]) {
   dokanOperations->UnlockFile = MirrorUnlockFile;
   dokanOperations->GetFileSecurity = MirrorGetFileSecurity;
   dokanOperations->SetFileSecurity = MirrorSetFileSecurity;
-  dokanOperations->GetDiskFreeSpace = NULL; // MirrorDokanGetDiskFreeSpace;
+  dokanOperations->GetDiskFreeSpace = MirrorDokanGetDiskFreeSpace;
   dokanOperations->GetVolumeInformation = MirrorGetVolumeInformation;
   dokanOperations->Unmounted = MirrorUnmounted;
   dokanOperations->FindStreams = MirrorFindStreams;

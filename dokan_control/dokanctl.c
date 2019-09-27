@@ -46,14 +46,14 @@ int ShowUsage() {
           "\n"
           "Example:\n"
           "  /u M                : Unmount M: drive\n"
-          "  /u C:\\mount\\dokan : Unmount mount point C:\\mount\\dokan\n"
+          "  /u C:\\mount\\dokan   : Unmount mount point C:\\mount\\dokan\n"
           "  /u 1                : Unmount mount point 1\n"
           "  /i d                : Install driver\n"
           "  /i n                : Install network provider\n"
           "  /r d                : Remove driver\n"
           "  /r n                : Remove network provider\n"
           "  /l a                : List current mount points\n"
-          "  /d [0-9]            : Enable Kernel Debug output\n"
+          "  /d [0-7]            : Enable Kernel Debug output\n"
           "  /v                  : Print Dokan version\n");
   return EXIT_FAILURE;
 }
@@ -180,7 +180,7 @@ int __cdecl wmain(int argc, PWCHAR argv[]) {
 
   case L'd': {
     WCHAR type = towlower(argv[2][0]);
-    if (L'0' > type || type > L'9')
+    if (L'0' > type || type > L'7')
       return DefaultCaseOption();
 
     ULONG mode = type - L'0';
@@ -202,33 +202,23 @@ int __cdecl wmain(int argc, PWCHAR argv[]) {
   // No admin rights required
   case L'l': {
     ULONG nbRead = 0;
-    PDOKAN_CONTROL dokanControl =
-        malloc(DOKAN_MAX_INSTANCES * sizeof(*dokanControl));
+    PDOKAN_CONTROL dokanControl = DokanGetMountPointList(FALSE, &nbRead);
     if (dokanControl == NULL) {
-      fprintf(stderr, "Failed to allocate dokanControl\n");
+      fwprintf(stderr, L"  Cannot retrieve mount point list.\n");
       return EXIT_FAILURE;
     }
 
-    ZeroMemory(dokanControl, DOKAN_MAX_INSTANCES * sizeof(*dokanControl));
-    if (DokanGetMountPointList(dokanControl, DOKAN_MAX_INSTANCES, FALSE,
-                               &nbRead)) {
-      fwprintf(stdout, L"  Mount points: %d\n", nbRead);
-      for (unsigned int p = 0; p < nbRead; ++p) {
-        fwprintf(stdout, L"  %u# MountPoint: %s - UNC: %s - DeviceName: %s\n",
-                 p, dokanControl[p].MountPoint, dokanControl[p].UNCName,
-                 dokanControl[p].DeviceName);
-      }
-    } else {
-      fwprintf(stderr, L"  Cannot retrieve mount point list.\n");
-      free(dokanControl);
-      return EXIT_FAILURE;
-    }
-    free(dokanControl);
+    fwprintf(stdout, L"  Mount points: %d\n", nbRead);
+    for (ULONG p = 0; p < nbRead; ++p)
+      fwprintf(stdout, L"  %u# MountPoint: %s - UNC: %s - DeviceName: %s\n", p,
+               dokanControl[p].MountPoint, dokanControl[p].UNCName,
+               dokanControl[p].DeviceName);
+    DokanReleaseMountPointList(dokanControl);
   } break;
 
   case L'v': {
     fprintf(stdout, "dokanctl : %s %s\n", __DATE__, __TIME__);
-    fprintf(stdout, "Dokan version : %d\n", DokanVersion());
+    fprintf(stdout, "Dokan version : %ld\n", DokanVersion());
     fprintf(stdout, "Dokan driver version : 0x%lx\n", DokanDriverVersion());
   } break;
 

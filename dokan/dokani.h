@@ -103,7 +103,7 @@ BOOL SendToDevice(LPCWSTR DeviceName, DWORD IoControlCode, PVOID InputBuffer,
                   ULONG InputLength, PVOID OutputBuffer, ULONG OutputLength,
                   PULONG ReturnedLength);
 
-LPWSTR
+VOID
 GetRawDeviceName(LPCWSTR DeviceName, LPWSTR DestinationBuffer,
                  rsize_t DestinationBufferSizeInElements);
 
@@ -187,6 +187,8 @@ VOID CheckFileName(LPWSTR FileName);
 VOID ClearFindData(PLIST_ENTRY ListHead);
 
 VOID ClearFindStreamData(PLIST_ENTRY ListHead);
+
+UINT WINAPI DokanKeepAlive(PVOID Param);
 
 PDOKAN_OPEN_INFO
 GetDokanOpenInfo(PEVENT_CONTEXT EventInfomation, PDOKAN_INSTANCE DokanInstance);

@@ -56,10 +56,59 @@ BOOL DOKANAPI DokanResetTimeout(ULONG Timeout, PDOKAN_FILE_INFO FileInfo) {
 
   eventInfo->SerialNumber = eventContext->SerialNumber;
   eventInfo->Operation.ResetTimeout.Timeout = Timeout;
-
-  status = SendToDevice(
-      GetRawDeviceName(instance->DeviceName, rawDeviceName, MAX_PATH),
+  GetRawDeviceName(instance->DeviceName, rawDeviceName, MAX_PATH);
+  status = SendToDevice(rawDeviceName,
       IOCTL_RESET_TIMEOUT, eventInfo, eventInfoSize, NULL, 0, &returnedLength);
   free(eventInfo);
   return status;
+}
+
+/* Legacy KeepAlive - Remove for 2.0.0 */
+UINT WINAPI DokanKeepAlive(PDOKAN_INSTANCE DokanInstance) {
+  HANDLE device;
+  ULONG ReturnedLength;
+  WCHAR rawDeviceName[MAX_PATH];
+
+  GetRawDeviceName(DokanInstance->DeviceName, rawDeviceName, MAX_PATH);
+
+  while (TRUE) {
+
+    device = CreateFile(rawDeviceName,
+        GENERIC_READ | GENERIC_WRITE,       // dwDesiredAccess
+        FILE_SHARE_READ | FILE_SHARE_WRITE, // dwShareMode
+        NULL,                               // lpSecurityAttributes
+        OPEN_EXISTING,                      // dwCreationDistribution
+        0,                                  // dwFlagsAndAttributes
+        NULL                                // hTemplateFile
+    );
+
+    if (device == INVALID_HANDLE_VALUE) {
+      DbgPrint(
+          "Dokan Error: DokanKeepAlive CreateFile failed %ws: %d\n",
+          rawDeviceName,
+          GetLastError());
+      break;
+    }
+
+    BOOL status = DeviceIoControl(device,          // Handle to device
+                                  IOCTL_KEEPALIVE, // IO Control code
+                                  NULL,            // Input Buffer to driver.
+                                  0,    // Length of input buffer in bytes.
+                                  NULL, // Output Buffer from driver.
+                                  0,    // Length of output buffer in bytes.
+                                  &ReturnedLength, // Bytes placed in buffer.
+                                  NULL             // synchronous call
+    );
+
+    CloseHandle(device);
+
+    if (!status) {
+      break;
+    }
+
+    Sleep(DOKAN_KEEPALIVE_TIME);
+  }
+
+  _endthreadex(0);
+  return STATUS_SUCCESS;
 }

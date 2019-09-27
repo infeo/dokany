@@ -2,6 +2,7 @@
   Dokan : user-mode file system library for Windows
 
   Copyright (C) 2015 - 2019 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2017 Google, Inc.
   Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
   http://dokan-dev.github.io
@@ -79,6 +80,7 @@ DokanDispatchWrite(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
     fcb = ccb->Fcb;
     ASSERT(fcb != NULL);
 
+    OplockDebugRecordMajorFunction(fcb, IRP_MJ_WRITE);
     if (DokanFCBFlagsIsSet(fcb, DOKAN_FILE_DIRECTORY)) {
       status = STATUS_INVALID_PARAMETER;
       __leave;
@@ -121,8 +123,8 @@ DokanDispatchWrite(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
                    writeToEoF ? NULL : &irpSp->Parameters.Write.ByteOffset,
                    irpSp->Parameters.Write.Length, NULL);
 
-      ExAcquireResourceExclusiveLite(&fcb->PagingIoResource, TRUE);
-      ExReleaseResourceLite(&fcb->PagingIoResource);
+      DokanPagingIoLockRW(fcb);
+      DokanPagingIoUnlock(fcb);
 
       CcPurgeCacheSection(&fcb->SectionObjectPointers,
                           writeToEoF ? NULL
@@ -142,9 +144,24 @@ DokanDispatchWrite(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
     // name
     DokanFCBLockRO(fcb);
     fcbLocked = TRUE;
-    eventLength = sizeof(EVENT_CONTEXT) + irpSp->Parameters.Write.Length +
-                  fcb->FileName.Length;
 
+    LARGE_INTEGER safeEventLength;
+    safeEventLength.QuadPart =
+        sizeof(EVENT_CONTEXT) + irpSp->Parameters.Write.Length +
+                  fcb->FileName.Length;
+    if (safeEventLength.HighPart != 0 ||
+        safeEventLength.QuadPart <
+            sizeof(EVENT_CONTEXT) + fcb->FileName.Length) {
+      DOKAN_INIT_LOGGER(logger, vcb->DeviceObject->DriverObject, IRP_MJ_WRITE);
+      DokanLogError(&logger,
+                    STATUS_INVALID_PARAMETER,
+                    L"Write with unsupported total size: %I64u",
+                    safeEventLength.QuadPart);
+      status = STATUS_INVALID_PARAMETER;
+      __leave;
+    }
+
+    eventLength = safeEventLength.LowPart;
     eventContext = AllocateEventContext(vcb->Dcb, Irp, eventLength, ccb);
 
     // no more memory!
@@ -232,8 +249,8 @@ DokanDispatchWrite(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
       //
       // FsRtlCheckOpLock is called with non-NULL completion routine - not blocking.
       if (!FlagOn(Irp->Flags, IRP_PAGING_IO)) {
-        status = FsRtlCheckOplock(DokanGetFcbOplock(fcb), Irp, eventContext,
-                                  DokanOplockComplete, DokanPrePostIrp);
+        status = DokanCheckOplock(fcb, Irp, eventContext, DokanOplockComplete,
+                                  DokanPrePostIrp);
 
         //
         //  if FsRtlCheckOplock returns STATUS_PENDING the IRP has been posted
@@ -324,9 +341,8 @@ DokanDispatchWrite(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
   return status;
 }
 
-NTSTATUS DokanCompleteWrite(__in PIRP_ENTRY IrpEntry,
-                            __in PEVENT_INFORMATION EventInfo,
-                            __in BOOLEAN Wait) {
+VOID DokanCompleteWrite(__in PIRP_ENTRY IrpEntry,
+                        __in PEVENT_INFORMATION EventInfo) {
   PIRP irp;
   PIO_STACK_LOCATION irpSp;
   NTSTATUS status = STATUS_SUCCESS;
@@ -335,7 +351,6 @@ NTSTATUS DokanCompleteWrite(__in PIRP_ENTRY IrpEntry,
   PFILE_OBJECT fileObject;
   BOOLEAN isPagingIo = FALSE;
 
-  UNREFERENCED_PARAMETER(Wait);
 
   fileObject = IrpEntry->FileObject;
   ASSERT(fileObject != NULL);
@@ -403,6 +418,4 @@ NTSTATUS DokanCompleteWrite(__in PIRP_ENTRY IrpEntry,
   DokanCompleteIrpRequest(irp, irp->IoStatus.Status, irp->IoStatus.Information);
 
   DDbgPrint("<== DokanCompleteWrite\n");
-
-  return STATUS_SUCCESS;
 }
