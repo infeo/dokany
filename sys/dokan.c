@@ -1,8 +1,8 @@
 /*
   Dokan : user-mode file system library for Windows
 
+  Copyright (C) 2017 - 2020 Google, Inc.
   Copyright (C) 2015 - 2019 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
-  Copyright (C) 2017 Google, Inc.
   Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
   http://dokan-dev.github.io
@@ -21,27 +21,31 @@ with this program. If not, see <http://www.gnu.org/licenses/>.
 */
 
 #include "dokan.h"
+#include "util/str.h"
 
-#include "dokanfs_msg.h"
+#include <mountmgr.h>
+
+static VOID InitMultiVersionResources();
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, DriverEntry)
+#pragma alloc_text(INIT, InitMultiVersionResources)
 #pragma alloc_text(PAGE, DokanUnload)
 #endif
 
-ULONG g_Debug = DOKAN_DEBUG_NONE;
 LOOKASIDE_LIST_EX g_DokanCCBLookasideList;
 LOOKASIDE_LIST_EX g_DokanFCBLookasideList;
 LOOKASIDE_LIST_EX g_DokanEResourceLookasideList;
-
-#if _WIN32_WINNT < 0x0501
-PFN_FSRTLTEARDOWNPERSTREAMCONTEXTS DokanFsRtlTeardownPerStreamContexts;
-#endif
+BOOLEAN g_FixFileNameForReparseMountPoint;
 
 NPAGED_LOOKASIDE_LIST DokanIrpEntryLookasideList;
-UNICODE_STRING FcbFileNameNull;
+ULONG DokanMdlSafePriority = 0;
 
+FAST_IO_DISPATCH FastIoDispatch;
 FAST_IO_CHECK_IF_POSSIBLE DokanFastIoCheckIfPossible;
+
+DokanPtr_FsRtlCheckLockForOplockRequest *DokanFsRtlCheckLockForOplockRequest = NULL;
+DokanPtr_FsRtlAreThereWaitingFileLocks *DokanFsRtlAreThereWaitingFileLocks = NULL;
 
 BOOLEAN
 DokanFastIoCheckIfPossible(__in PFILE_OBJECT FileObject,
@@ -163,16 +167,12 @@ DokanFilterCallbackAcquireForCreateSection(__in PFS_FILTER_CALLBACK_DATA
 
 BOOLEAN
 DokanLookasideCreate(LOOKASIDE_LIST_EX *pCache, size_t cbElement) {
-#if _WIN32_WINNT > 0x601
-  NTSTATUS Status = ExInitializeLookasideListEx(
-      pCache, NULL, NULL, NonPagedPoolNx, 0, cbElement, TAG, 0);
-#else
   NTSTATUS Status = ExInitializeLookasideListEx(
       pCache, NULL, NULL, NonPagedPool, 0, cbElement, TAG, 0);
-#endif
 
   if (!NT_SUCCESS(Status)) {
-    DDbgPrint("ExInitializeLookasideListEx failed, Status (0x%x)", Status);
+    DDbgPrint("ExInitializeLookasideListEx failed, Status (0x%x) %ls\n", Status,
+              DokanGetNTSTATUSStr(Status));
     return FALSE;
   }
 
@@ -195,6 +195,27 @@ VOID CleanupGlobalDiskDevice(PDOKAN_GLOBAL dokanGlobal) {
   IoDeleteDevice(dokanGlobal->FsCdDeviceObject);
   IoDeleteDevice(dokanGlobal->DeviceObject);
   ExDeleteResourceLite(&dokanGlobal->Resource);
+  ExDeleteResourceLite(&dokanGlobal->MountManagerLock);
+}
+
+VOID InitMultiVersionResources() {
+  // Enable No-Execute Nonpaged Pool - POOL_NX_OPTIN
+  ExInitializeDriverRuntime(DrvRtPoolNxOptIn);
+
+  if (RtlIsNtDdiVersionAvailable(NTDDI_WIN8)) {
+
+    DokanMdlSafePriority = MdlMappingNoExecute;
+
+    UNICODE_STRING SystemRoutineName;
+    RtlInitUnicodeString(&SystemRoutineName, L"FsRtlCheckLockForOplockRequest");
+    DokanFsRtlCheckLockForOplockRequest =
+        (DokanPtr_FsRtlCheckLockForOplockRequest *)MmGetSystemRoutineAddress(
+            &SystemRoutineName);
+    RtlInitUnicodeString(&SystemRoutineName, L"FsRtlAreThereWaitingFileLocks");
+    DokanFsRtlAreThereWaitingFileLocks =
+        (DokanPtr_FsRtlAreThereWaitingFileLocks *)MmGetSystemRoutineAddress(
+            &SystemRoutineName);
+  }
 }
 
 NTSTATUS
@@ -219,7 +240,6 @@ Return Value:
 
 {
   NTSTATUS status;
-  PFAST_IO_DISPATCH fastIoDispatch;
   FS_FILTER_CALLBACKS filterCallbacks;
   PDOKAN_GLOBAL dokanGlobal = NULL;
 
@@ -266,44 +286,28 @@ Return Value:
   DriverObject->MajorFunction[IRP_MJ_QUERY_SECURITY] = DokanBuildRequest;
   DriverObject->MajorFunction[IRP_MJ_SET_SECURITY] = DokanBuildRequest;
 
-  fastIoDispatch = ExAllocatePool(sizeof(FAST_IO_DISPATCH));
-  if (!fastIoDispatch) {
-    CleanupGlobalDiskDevice(dokanGlobal);
-    DDbgPrint("  ExAllocatePool failed");
-    return STATUS_INSUFFICIENT_RESOURCES;
-  }
+  RtlZeroMemory(&FastIoDispatch, sizeof(FAST_IO_DISPATCH));
 
-  RtlZeroMemory(fastIoDispatch, sizeof(FAST_IO_DISPATCH));
+  FastIoDispatch.SizeOfFastIoDispatch = sizeof(FAST_IO_DISPATCH);
+  FastIoDispatch.FastIoCheckIfPossible = DokanFastIoCheckIfPossible;
+  // FastIoDispatch.FastIoRead = DokanFastIoRead;
+  FastIoDispatch.FastIoRead = FsRtlCopyRead;
+  FastIoDispatch.FastIoWrite = FsRtlCopyWrite;
+  FastIoDispatch.AcquireFileForNtCreateSection = DokanAcquireForCreateSection;
+  FastIoDispatch.ReleaseFileForNtCreateSection = DokanReleaseForCreateSection;
+  FastIoDispatch.AcquireForCcFlush = DokanAcquireForCcFlush;
+  FastIoDispatch.ReleaseForCcFlush = DokanReleaseForCcFlush;
+  FastIoDispatch.MdlRead = FsRtlMdlReadDev;
+  FastIoDispatch.MdlReadComplete = FsRtlMdlReadCompleteDev;
+  FastIoDispatch.PrepareMdlWrite = FsRtlPrepareMdlWriteDev;
+  FastIoDispatch.MdlWriteComplete = FsRtlMdlWriteCompleteDev;
 
-  fastIoDispatch->SizeOfFastIoDispatch = sizeof(FAST_IO_DISPATCH);
-  fastIoDispatch->FastIoCheckIfPossible = DokanFastIoCheckIfPossible;
-  // fastIoDispatch->FastIoRead = DokanFastIoRead;
-  fastIoDispatch->FastIoRead = FsRtlCopyRead;
-  fastIoDispatch->FastIoWrite = FsRtlCopyWrite;
-  fastIoDispatch->AcquireFileForNtCreateSection = DokanAcquireForCreateSection;
-  fastIoDispatch->ReleaseFileForNtCreateSection = DokanReleaseForCreateSection;
-  fastIoDispatch->AcquireForCcFlush = DokanAcquireForCcFlush;
-  fastIoDispatch->ReleaseForCcFlush = DokanReleaseForCcFlush;
-  fastIoDispatch->MdlRead = FsRtlMdlReadDev;
-  fastIoDispatch->MdlReadComplete = FsRtlMdlReadCompleteDev;
-  fastIoDispatch->PrepareMdlWrite = FsRtlPrepareMdlWriteDev;
-  fastIoDispatch->MdlWriteComplete = FsRtlMdlWriteCompleteDev;
+  DriverObject->FastIoDispatch = &FastIoDispatch;
 
-  DriverObject->FastIoDispatch = fastIoDispatch;
-#if _WIN32_WINNT >= _WIN32_WINNT_WIN8
-  ExInitializeNPagedLookasideList(&DokanIrpEntryLookasideList, NULL, NULL,
-                                  POOL_NX_ALLOCATION, sizeof(IRP_ENTRY), TAG,
-                                  0);
-#else
+  InitMultiVersionResources();
+
   ExInitializeNPagedLookasideList(&DokanIrpEntryLookasideList, NULL, NULL, 0,
                                   sizeof(IRP_ENTRY), TAG, 0);
-#endif
-
-#if _WIN32_WINNT < 0x0501
-  RtlInitUnicodeString(&functionName, L"FsRtlTeardownPerStreamContexts");
-  DokanFsRtlTeardownPerStreamContexts =
-      MmGetSystemRoutineAddress(&functionName);
-#endif
 
   RtlZeroMemory(&filterCallbacks, sizeof(FS_FILTER_CALLBACKS));
 
@@ -317,23 +321,20 @@ Return Value:
 
   if (!NT_SUCCESS(status)) {
     CleanupGlobalDiskDevice(dokanGlobal);
-    ExFreePool(DriverObject->FastIoDispatch);
-    DDbgPrint("  FsRtlRegisterFileSystemFilterCallbacks returned 0x%x\n",
-              status);
+    DDbgPrint("  FsRtlRegisterFileSystemFilterCallbacks returned 0x%x %ls\n",
+              status, DokanGetNTSTATUSStr(status));
     return status;
   }
 
   if (!DokanLookasideCreate(&g_DokanCCBLookasideList, sizeof(DokanCCB))) {
     DDbgPrint("  DokanLookasideCreate g_DokanCCBLookasideList  failed");
     CleanupGlobalDiskDevice(dokanGlobal);
-    ExFreePool(DriverObject->FastIoDispatch);
     return STATUS_INSUFFICIENT_RESOURCES;
   }
 
   if (!DokanLookasideCreate(&g_DokanFCBLookasideList, sizeof(DokanFCB))) {
     DDbgPrint("  DokanLookasideCreate g_DokanFCBLookasideList  failed");
     CleanupGlobalDiskDevice(dokanGlobal);
-    ExFreePool(DriverObject->FastIoDispatch);
     ExDeleteLookasideListEx(&g_DokanCCBLookasideList);
     return STATUS_INSUFFICIENT_RESOURCES;
   }
@@ -342,11 +343,15 @@ Return Value:
                             sizeof(ERESOURCE))) {
     DDbgPrint("  DokanLookasideCreate g_DokanEResourceLookasideList  failed");
     CleanupGlobalDiskDevice(dokanGlobal);
-    ExFreePool(DriverObject->FastIoDispatch);
     ExDeleteLookasideListEx(&g_DokanCCBLookasideList);
     ExDeleteLookasideListEx(&g_DokanFCBLookasideList);
     return STATUS_INSUFFICIENT_RESOURCES;
   }
+
+  // Detect if we are running on a older version than NTDDI_WIN10_RS4
+  // needing to fix FileName during Reparse MountPoint.
+  g_FixFileNameForReparseMountPoint =
+      !RtlIsNtDdiVersionAvailable(0x0A000005);
 
   DDbgPrint("<== DriverEntry\n");
 
@@ -383,7 +388,6 @@ Return Value:
   if (GetIdentifierType(dokanGlobal) == DGL) {
     DDbgPrint("  Delete Global DeviceObject\n");
     CleanupGlobalDiskDevice(dokanGlobal);
-    ExFreePool(DriverObject->FastIoDispatch);
   }
 
   ExDeleteNPagedLookasideList(&DokanIrpEntryLookasideList);
@@ -444,148 +448,11 @@ NTSTATUS DokanCheckOplock(
   ASSERT(Fcb->Vcb != NULL);
   ASSERT(Fcb->Vcb->Dcb != NULL);
   if (Fcb->Vcb != NULL && Fcb->Vcb->Dcb != NULL &&
-      !Fcb->Vcb->Dcb->OplocksDisabled) {
+      !(Fcb->Vcb->Dcb->MountOptions & DOKAN_EVENT_DISABLE_OPLOCKS)) {
     return FsRtlCheckOplock(DokanGetFcbOplock(Fcb), Irp, Context,
                             CompletionRoutine, PostIrpRoutine);
   }
   return STATUS_SUCCESS;
-}
-
-
-#define PrintStatus(val, flag)                                                 \
-  if (val == flag)                                                             \
-  DDbgPrint("  status = " #flag "\n")
-
-#define DOKAN_LOG_MAX_CHAR_COUNT 2048
-#define DOKAN_LOG_MAX_PACKET_BYTES                                             \
-  (ERROR_LOG_MAXIMUM_SIZE - sizeof(IO_ERROR_LOG_PACKET))
-#define DOKAN_LOG_MAX_PACKET_NONNULL_CHARS                                     \
-  (DOKAN_LOG_MAX_PACKET_BYTES / sizeof(WCHAR) - 1)
-
-VOID DokanPrintToSysLog(__in PDRIVER_OBJECT DriverObject,
-                        __in UCHAR MajorFunctionCode,
-                        __in NTSTATUS MessageId,
-                        __in NTSTATUS Status,
-                        __in LPCTSTR Format,
-                        __in va_list Args) {
-  NTSTATUS status = STATUS_SUCCESS;
-  PIO_ERROR_LOG_PACKET packet = NULL;
-  WCHAR *message = NULL;
-  size_t messageCapacity = DOKAN_LOG_MAX_CHAR_COUNT;
-  size_t messageCharCount = 0;
-  size_t messageCharsWritten = 0;
-  size_t packetCount = 0;
-  size_t i = 0;
-  UCHAR packetCharCount = 0;
-  UCHAR packetSize = 0;
-
-  __try {
-    message = ExAllocatePool(sizeof(WCHAR) * messageCapacity);
-    if (message == NULL) {
-      DDbgPrint("Failed to allocate message of capacity %d\n", messageCapacity);
-      __leave;
-    }
-
-    status = RtlStringCchVPrintfW(message, messageCapacity, Format, Args);
-    if (status == STATUS_BUFFER_OVERFLOW) {
-      // In this case we want to at least log what we can fit.
-      DDbgPrint("Log message was larger than DOKAN_LOG_MAX_CHAR_COUNT."
-                " Format: %S\n", Format);
-    } else if (status != STATUS_SUCCESS) {
-      DDbgPrint("Failed to generate log message with format: %S; status: %x\n",
-                Format, status);
-      __leave;
-    }
-
-    status = RtlStringCchLengthW(message, messageCapacity, &messageCharCount);
-    if (status != STATUS_SUCCESS) {
-      DDbgPrint("Failed to determine message length, status: %x\n", status);
-      __leave;
-    }
-
-    packetCount = messageCharCount / DOKAN_LOG_MAX_PACKET_NONNULL_CHARS;
-    if (messageCharCount % DOKAN_LOG_MAX_PACKET_NONNULL_CHARS != 0) {
-      ++packetCount;
-    }
-
-    for (i = 0; i < packetCount; i++) {
-      packetCharCount = (UCHAR)min(messageCharCount - messageCharsWritten,
-                                   DOKAN_LOG_MAX_PACKET_NONNULL_CHARS);
-      packetSize = sizeof(IO_ERROR_LOG_PACKET)
-          + sizeof(WCHAR) * (packetCharCount + 1);
-      packet = IoAllocateErrorLogEntry(DriverObject, packetSize);
-      if (packet == NULL) {
-        DDbgPrint("Failed to allocate packet of size %d\n", packetSize);
-        __leave;
-      }
-      RtlZeroMemory(packet, packetSize);
-      packet->MajorFunctionCode = MajorFunctionCode;
-      packet->NumberOfStrings = 1;
-      packet->StringOffset =
-          (USHORT)((char *)&packet->DumpData[0] - (char *)packet);
-      packet->ErrorCode = MessageId;
-      packet->FinalStatus = Status;
-      RtlCopyMemory(&packet->DumpData[0], message + messageCharsWritten,
-                    sizeof(WCHAR) * packetCharCount);
-      IoWriteErrorLogEntry(packet); // Destroys packet.
-      packet = NULL;
-      messageCharsWritten += packetCharCount;
-    }
-  } __finally {
-    if (message != NULL) {
-      ExFreePool(message);
-    }
-  }
-}
-
-NTSTATUS DokanLogError(__in PDOKAN_LOGGER Logger,
-                       __in NTSTATUS Status,
-                       __in LPCTSTR Format,
-                       ...) {
-  va_list args;
-  va_start(args, Format);
-  DokanPrintToSysLog(Logger->DriverObject, Logger->MajorFunctionCode,
-                     DOKANFS_ERROR_MSG, Status, Format, args);
-  va_end(args);
-  return Status;
-}
-
-VOID DokanLogInfo(__in PDOKAN_LOGGER Logger, __in LPCTSTR Format, ...) {
-  va_list args;
-  va_start(args, Format);
-  DokanPrintToSysLog(Logger->DriverObject, Logger->MajorFunctionCode,
-                     DOKANFS_INFO_MSG, STATUS_SUCCESS, Format, args);
-  va_end(args);
-}
-
-VOID DokanPrintNTStatus(NTSTATUS Status) {
-  DDbgPrint("  status = 0x%x\n", Status);
-
-  PrintStatus(Status, STATUS_SUCCESS);
-  PrintStatus(Status, STATUS_PENDING);
-  PrintStatus(Status, STATUS_NO_MORE_FILES);
-  PrintStatus(Status, STATUS_END_OF_FILE);
-  PrintStatus(Status, STATUS_NO_SUCH_FILE);
-  PrintStatus(Status, STATUS_NOT_IMPLEMENTED);
-  PrintStatus(Status, STATUS_BUFFER_OVERFLOW);
-  PrintStatus(Status, STATUS_FILE_IS_A_DIRECTORY);
-  PrintStatus(Status, STATUS_SHARING_VIOLATION);
-  PrintStatus(Status, STATUS_OBJECT_NAME_INVALID);
-  PrintStatus(Status, STATUS_OBJECT_NAME_NOT_FOUND);
-  PrintStatus(Status, STATUS_OBJECT_NAME_COLLISION);
-  PrintStatus(Status, STATUS_OBJECT_PATH_INVALID);
-  PrintStatus(Status, STATUS_OBJECT_PATH_NOT_FOUND);
-  PrintStatus(Status, STATUS_OBJECT_PATH_SYNTAX_BAD);
-  PrintStatus(Status, STATUS_ACCESS_DENIED);
-  PrintStatus(Status, STATUS_ACCESS_VIOLATION);
-  PrintStatus(Status, STATUS_INVALID_PARAMETER);
-  PrintStatus(Status, STATUS_INVALID_USER_BUFFER);
-  PrintStatus(Status, STATUS_INVALID_HANDLE);
-  PrintStatus(Status, STATUS_INSUFFICIENT_RESOURCES);
-  PrintStatus(Status, STATUS_DEVICE_DOES_NOT_EXIST);
-  PrintStatus(Status, STATUS_INVALID_DEVICE_REQUEST);
-  PrintStatus(Status, STATUS_VOLUME_DISMOUNTED);
-  PrintStatus(Status, STATUS_NO_SUCH_DEVICE);
 }
 
 VOID DokanCompleteIrpRequest(__in PIRP Irp, __in NTSTATUS Status,
@@ -606,8 +473,26 @@ VOID DokanCompleteIrpRequest(__in PIRP Irp, __in NTSTATUS Status,
   DokanPrintNTStatus(Status);
 }
 
-VOID DokanNotifyReportChange0(__in PDokanFCB Fcb, __in PUNICODE_STRING FileName,
-                              __in ULONG FilterMatch, __in ULONG Action) {
+VOID DokanCompleteDispatchRoutine(__in PIRP Irp, __in NTSTATUS Status) {
+  if (Irp == NULL) {
+    DDbgPrint("  Irp is NULL, so no complete required\n");
+    return;
+  }
+  if (Status == -1) {
+    DDbgPrint("  Status is -1 which is not valid NTSTATUS\n");
+    Status = STATUS_INVALID_PARAMETER;
+  }
+  if (Status != STATUS_PENDING) {
+    Irp->IoStatus.Status = Status;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+  }
+  DokanPrintNTStatus(Status);
+}
+
+NTSTATUS DokanNotifyReportChange0(__in PDokanFCB Fcb,
+                                  __in PUNICODE_STRING FileName,
+                                  __in ULONG FilterMatch,
+                                  __in ULONG Action) {
   USHORT nameOffset;
 
   DDbgPrint("==> DokanNotifyReportChange %wZ\n", FileName);
@@ -615,7 +500,9 @@ VOID DokanNotifyReportChange0(__in PDokanFCB Fcb, __in PUNICODE_STRING FileName,
   ASSERT(Fcb != NULL);
   ASSERT(FileName != NULL);
 
-  if (DokanUnicodeStringChar(FileName, L':') != -1) { //FileStream
+  // Alternate streams are supposed to use a different set of action
+  // and filter values, but we do not expect the caller to be aware of this.
+  if (DokanSearchUnicodeStringChar(FileName, L':') != -1) {  // FileStream
 
     //Convert file action to stream action
     switch (Action) {
@@ -632,7 +519,7 @@ VOID DokanNotifyReportChange0(__in PDokanFCB Fcb, __in PUNICODE_STRING FileName,
       break;
     }
 
-    //Convert file flag to stream flag
+    // Convert file flag to stream flag
     if (FlagOn(FilterMatch,
                FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_FILE_NAME))
       SetFlag(FilterMatch, FILE_NOTIFY_CHANGE_STREAM_NAME);
@@ -641,7 +528,7 @@ VOID DokanNotifyReportChange0(__in PDokanFCB Fcb, __in PUNICODE_STRING FileName,
     if (FlagOn(FilterMatch, FILE_NOTIFY_CHANGE_LAST_WRITE))
       SetFlag(FilterMatch, FILE_NOTIFY_CHANGE_STREAM_WRITE);
 
-    //Cleanup file flag converted
+    // Cleanup file flag converted
     ClearFlag(FilterMatch, ~(FILE_NOTIFY_CHANGE_STREAM_NAME |
                              FILE_NOTIFY_CHANGE_STREAM_SIZE |
                              FILE_NOTIFY_CHANGE_STREAM_WRITE));
@@ -654,49 +541,41 @@ VOID DokanNotifyReportChange0(__in PDokanFCB Fcb, __in PUNICODE_STRING FileName,
       FileName, L'\\', (ULONG)nameOffset, 1));
   nameOffset *= sizeof(WCHAR); // Offset is in bytes
 
-  FsRtlNotifyFullReportChange(Fcb->Vcb->NotifySync, &Fcb->Vcb->DirNotifyList,
-                              (PSTRING)FileName, nameOffset,
-                              NULL, // StreamName
-                              NULL, // NormalizedParentName
-                              FilterMatch, Action,
-                              NULL); // TargetContext
-
+  __try {
+    FsRtlNotifyFullReportChange(Fcb->Vcb->NotifySync, &Fcb->Vcb->DirNotifyList,
+                                (PSTRING)FileName, nameOffset,
+                                NULL, // StreamName
+                                NULL, // NormalizedParentName
+                                FilterMatch, Action,
+                                NULL); // TargetContext
+  } __except (GetExceptionCode() == STATUS_ACCESS_VIOLATION
+              ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+    DOKAN_INIT_LOGGER(logger, Fcb->Vcb->Dcb->DriverObject, 0);
+    try {
+      // This case is attested in the wild but very rare. We don't know why it
+      // happens.
+      return DokanLogError(
+          &logger, STATUS_OBJECT_NAME_INVALID,
+          L"Access violation in file change notification for %wZ.", FileName);
+    } __except(GetExceptionCode() == STATUS_ACCESS_VIOLATION
+               ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+       // This is not a case we think ever happens, but we may as well not
+       // crash if it does.
+       return DokanLogError(
+            &logger, STATUS_INVALID_PARAMETER,
+            L"Access violation on the file name passed in a notification.");
+    }
+  }
   DDbgPrint("<== DokanNotifyReportChange\n");
+  return STATUS_SUCCESS;
 }
 
 // DokanNotifyReportChange should be called with the Fcb at least share-locked.
 // due to the ro access to the FileName field.
-VOID DokanNotifyReportChange(__in PDokanFCB Fcb, __in ULONG FilterMatch,
-                             __in ULONG Action) {
+NTSTATUS DokanNotifyReportChange(__in PDokanFCB Fcb, __in ULONG FilterMatch,
+                                 __in ULONG Action) {
   ASSERT(Fcb != NULL);
-  DokanNotifyReportChange0(Fcb, &Fcb->FileName, FilterMatch, Action);
-}
-
-VOID PrintIdType(__in VOID *Id) {
-  if (Id == NULL) {
-    DDbgPrint("    IdType = NULL\n");
-    return;
-  }
-  switch (GetIdentifierType(Id)) {
-  case DGL:
-    DDbgPrint("    IdType = DGL\n");
-    break;
-  case DCB:
-    DDbgPrint("   IdType = DCB\n");
-    break;
-  case VCB:
-    DDbgPrint("   IdType = VCB\n");
-    break;
-  case FCB:
-    DDbgPrint("   IdType = FCB\n");
-    break;
-  case CCB:
-    DDbgPrint("   IdType = CCB\n");
-    break;
-  default:
-    DDbgPrint("   IdType = Unknown\n");
-    break;
-  }
+  return DokanNotifyReportChange0(Fcb, &Fcb->FileName, FilterMatch, Action);
 }
 
 BOOLEAN
@@ -771,16 +650,16 @@ PointerAlignSize(ULONG sizeInBytes) {
 }
 
 #define DOKAN_RESOURCE_LOCK_DEBUG_INTERVAL_MSEC 10
-#define DOKAN_RESOURCE_LOCK_WARNING_MSEC 1000000  // 1 sec
+#define DOKAN_RESOURCE_LOCK_WARNING_MSEC 1000000 // 1 sec
 
 static const UNICODE_STRING noName = RTL_CONSTANT_STRING(L"<no name>");
 
-VOID DokanLockWarn(__in const ERESOURCE* Resource,
-                   __in const DokanResourceDebugInfo* DebugInfo,
+VOID DokanLockWarn(__in const ERESOURCE *Resource,
+                   __in const DokanResourceDebugInfo *DebugInfo,
                    __in PDOKAN_LOGGER Logger,
-                   __in const char* Site,
-                   __in const UNICODE_STRING* ObjectName,
-                   __in const void* ObjectPointer) {
+                   __in const char *Site,
+                   __in const UNICODE_STRING *ObjectName,
+                   __in const void *ObjectPointer) {
   if (ObjectName == NULL || ObjectName->Length == 0) {
     ObjectName = &noName;
   }
@@ -843,7 +722,7 @@ VOID DokanLockWarn(__in const ERESOURCE* Resource,
   }
 }
 
-VOID DokanLockNotifyResolved(__in const ERESOURCE* Resource,
+VOID DokanLockNotifyResolved(__in const ERESOURCE *Resource,
                              __in PDOKAN_LOGGER Logger) {
   DokanLogInfo(Logger,
       L"Blocking on ERESOURCE %I64x has resolved on thread %I64x",
@@ -861,9 +740,9 @@ VOID DokanResourceLockWithDebugInfo(__in BOOLEAN Writable,
                                     __in PERESOURCE Resource,
                                     __in PDokanResourceDebugInfo DebugInfo,
                                     __in PDOKAN_LOGGER Logger,
-                                    __in const char* Site,
-                                    __in const UNICODE_STRING* ObjectName,
-                                    __in const void* ObjectPointer) {
+                                    __in const char *Site,
+                                    __in const UNICODE_STRING *ObjectName,
+                                    __in const void *ObjectPointer) {
   // The wait is in 100ns units. Negative means "from now" as opposed to an
   // absolute wake up time.
   LARGE_INTEGER wait = RtlConvertLongToLargeInteger(
@@ -934,26 +813,26 @@ BOOLEAN DokanVCBTryLockRW(PDokanVCB Vcb) {
 
 ULONG GetOplockControlDebugInfoBit(ULONG FsControlCode) {
   switch (FsControlCode) {
-    case FSCTL_REQUEST_OPLOCK_LEVEL_1:
-      return 1;
-    case FSCTL_REQUEST_OPLOCK_LEVEL_2:
-      return 2;
-    case FSCTL_REQUEST_BATCH_OPLOCK:
-      return 4;
-    case FSCTL_OPLOCK_BREAK_ACKNOWLEDGE:
-      return 8;
-    case FSCTL_OPBATCH_ACK_CLOSE_PENDING:
-      return 16;
-    case FSCTL_OPLOCK_BREAK_NOTIFY:
-      return 32;
-    case FSCTL_OPLOCK_BREAK_ACK_NO_2:
-      return 64;
-    case FSCTL_REQUEST_FILTER_OPLOCK:
-      return 128;
-    case FSCTL_REQUEST_OPLOCK:
-      return 256;
-    default:
-      return 65536;
+  case FSCTL_REQUEST_OPLOCK_LEVEL_1:
+    return 1;
+  case FSCTL_REQUEST_OPLOCK_LEVEL_2:
+    return 2;
+  case FSCTL_REQUEST_BATCH_OPLOCK:
+    return 4;
+  case FSCTL_OPLOCK_BREAK_ACKNOWLEDGE:
+    return 8;
+  case FSCTL_OPBATCH_ACK_CLOSE_PENDING:
+    return 16;
+  case FSCTL_OPLOCK_BREAK_NOTIFY:
+    return 32;
+  case FSCTL_OPLOCK_BREAK_ACK_NO_2:
+    return 64;
+  case FSCTL_REQUEST_FILTER_OPLOCK:
+    return 128;
+  case FSCTL_REQUEST_OPLOCK:
+    return 256;
+  default:
+    return 65536;
   }
 }
 
@@ -994,4 +873,26 @@ void OplockDebugRecordCreateRequest(__in PDokanFCB Fcb,
 void OplockDebugRecordAtomicRequest(PDokanFCB Fcb) {
   OplockDebugRecordProcess(Fcb);
   InterlockedIncrement(&Fcb->OplockDebugInfo.AtomicRequestCount);
+}
+
+VOID RunAsSystem(_In_ PKSTART_ROUTINE StartRoutine, PVOID StartContext) {
+  HANDLE handle;
+  PKTHREAD thread;
+  OBJECT_ATTRIBUTES objectAttribs;
+
+  InitializeObjectAttributes(&objectAttribs, NULL, OBJ_KERNEL_HANDLE, NULL,
+                             NULL);
+  NTSTATUS status =
+      PsCreateSystemThread(&handle, THREAD_ALL_ACCESS, &objectAttribs, NULL,
+                           NULL, StartRoutine, StartContext);
+  if (!NT_SUCCESS(status)) {
+    DDbgPrint("PsCreateSystemThread failed: 0x%X %ls\n", status,
+              DokanGetNTSTATUSStr(status));
+  } else {
+    ObReferenceObjectByHandle(handle, THREAD_ALL_ACCESS, NULL, KernelMode,
+                              &thread, NULL);
+    ZwClose(handle);
+    KeWaitForSingleObject(thread, Executive, KernelMode, FALSE, NULL);
+    ObDereferenceObject(thread);
+  }
 }

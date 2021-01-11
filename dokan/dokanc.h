@@ -1,6 +1,7 @@
 /*
   Dokan : user-mode file system library for Windows
 
+  Copyright (C) 2020 Google, Inc.
   Copyright (C) 2015 - 2019 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
   Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
@@ -52,10 +53,10 @@ extern BOOL g_DebugMode;
 // DokanOptions->UseStdErr is ON?
 extern BOOL g_UseStdErr;
 
-#ifdef _MSC_VER
+#if defined(_MSC_VER) || (defined(__GNUC__) && !defined(__CYGWIN__))
 
 static VOID DokanDbgPrint(LPCSTR format, ...) {
-  const char *outputString = format;    // fallback
+  const char *outputString = format; // fallback
   char *buffer = NULL;
   int length;
   va_list argp;
@@ -80,7 +81,7 @@ static VOID DokanDbgPrint(LPCSTR format, ...) {
 }
 
 static VOID DokanDbgPrintW(LPCWSTR format, ...) {
-  const WCHAR *outputString = format;   // fallback
+  const WCHAR *outputString = format; // fallback
   WCHAR *buffer = NULL;
   int length;
   va_list argp;
@@ -102,6 +103,8 @@ static VOID DokanDbgPrintW(LPCWSTR format, ...) {
   va_end(argp);
 }
 
+#if defined(_MSC_VER)
+
 #define DbgPrint(format, ...)                                                  \
   do {                                                                         \
     if (g_DebugMode) {                                                         \
@@ -120,7 +123,27 @@ static VOID DokanDbgPrintW(LPCWSTR format, ...) {
   __pragma(warning(push)) __pragma(warning(disable : 4127)) while (0)          \
       __pragma(warning(pop))
 
-#endif // MSVC
+#endif // defined(_MSC_VER)
+
+#if defined(__GNUC__)
+
+#define DbgPrint(format, ...)                                                  \
+  do {                                                                         \
+    if (g_DebugMode) {                                                         \
+      DokanDbgPrint(format, ##__VA_ARGS__);                                    \
+    }                                                                          \
+  } while (0)
+
+#define DbgPrintW(format, ...)                                                 \
+  do {                                                                         \
+    if (g_DebugMode) {                                                         \
+      DokanDbgPrintW(format, ##__VA_ARGS__);                                   \
+    }                                                                          \
+  } while (0)
+
+#endif // defined(__GNUC__)
+
+#endif // defined(_MSC_VER) || (defined(__GNUC__) && !defined(__CYGWIN__))
 
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 

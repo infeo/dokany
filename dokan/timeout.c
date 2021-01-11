@@ -1,6 +1,7 @@
 /*
   Dokan : user-mode file system library for Windows
 
+  Copyright (C) 2020 Google, Inc.
   Copyright (C) 2015 - 2019 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
   Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
@@ -64,7 +65,8 @@ BOOL DOKANAPI DokanResetTimeout(ULONG Timeout, PDOKAN_FILE_INFO FileInfo) {
 }
 
 /* Legacy KeepAlive - Remove for 2.0.0 */
-UINT WINAPI DokanKeepAlive(PDOKAN_INSTANCE DokanInstance) {
+UINT WINAPI DokanKeepAlive(PVOID instance) {
+  PDOKAN_INSTANCE DokanInstance = (PDOKAN_INSTANCE)instance;
   HANDLE device;
   ULONG ReturnedLength;
   WCHAR rawDeviceName[MAX_PATH];

@@ -1,6 +1,7 @@
 /*
   Dokan : user-mode file system library for Windows
 
+  Copyright (C) 2020 Google, Inc.
   Copyright (C) 2015 - 2019 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
   Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
@@ -42,6 +43,7 @@ THE SOFTWARE.
 
 BOOL g_UseStdErr;
 BOOL g_DebugMode;
+BOOL g_CaseSensitive;
 BOOL g_HasSeSecurityPrivilege;
 BOOL g_ImpersonateCallerUser;
 
@@ -314,6 +316,9 @@ MirrorCreateFile(LPCWSTR FileName, PDOKAN_IO_SECURITY_CONTEXT SecurityContext,
   MirrorCheckFlag(fileAttributesAndFlags, SECURITY_CONTEXT_TRACKING);
   MirrorCheckFlag(fileAttributesAndFlags, SECURITY_EFFECTIVE_ONLY);
   MirrorCheckFlag(fileAttributesAndFlags, SECURITY_SQOS_PRESENT);
+
+  if (g_CaseSensitive)
+    fileAttributesAndFlags |= FILE_FLAG_POSIX_SEMANTICS;
 
   if (creationDisposition == CREATE_NEW) {
     DbgPrint(L"\tCREATE_NEW\n");
@@ -956,7 +961,13 @@ MirrorMoveFile(LPCWSTR FileName, // existing file name
   PFILE_RENAME_INFO renameInfo = NULL;
 
   GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
-  GetFilePath(newFilePath, DOKAN_MAX_PATH, NewFileName);
+  if (wcslen(NewFileName) && NewFileName[0] != ':') {
+    GetFilePath(newFilePath, DOKAN_MAX_PATH, NewFileName);
+  } else {
+    // For a stream rename, FileRenameInfo expect the FileName param without the filename
+    // like :<stream name>:<stream type>
+    wcsncpy_s(newFilePath, DOKAN_MAX_PATH, NewFileName, wcslen(NewFileName));
+  }
 
   DbgPrint(L"MoveFile %s -> %s\n\n", filePath, newFilePath);
   handle = (HANDLE)DokanFileInfo->Context;
@@ -1323,10 +1334,12 @@ static NTSTATUS DOKAN_CALLBACK MirrorGetVolumeInformation(
     *VolumeSerialNumber = 0x19831116;
   if (MaximumComponentLength)
     *MaximumComponentLength = 255;
-  if (FileSystemFlags)
-    *FileSystemFlags = FILE_CASE_SENSITIVE_SEARCH | FILE_CASE_PRESERVED_NAMES |
-                       FILE_SUPPORTS_REMOTE_STORAGE | FILE_UNICODE_ON_DISK |
+  if (FileSystemFlags) {
+    *FileSystemFlags = FILE_SUPPORTS_REMOTE_STORAGE | FILE_UNICODE_ON_DISK |
                        FILE_PERSISTENT_ACLS | FILE_NAMED_STREAMS;
+    if (g_CaseSensitive)
+      *FileSystemFlags = FILE_CASE_SENSITIVE_SEARCH | FILE_CASE_PRESERVED_NAMES;
+  }
 
   volumeRoot[0] = RootDirectory[0];
   volumeRoot[1] = ':';
@@ -1368,7 +1381,7 @@ static NTSTATUS DOKAN_CALLBACK MirrorGetVolumeInformation(
   return STATUS_SUCCESS;
 }
 
-// Uncomment the function and set dokanOperations->GetDiskFreeSpace to personalize disk space
+// Uncomment the function and set dokanOperations.GetDiskFreeSpace to personalize disk space
 /*
 static NTSTATUS DOKAN_CALLBACK MirrorDokanGetDiskFreeSpace(
     PULONGLONG FreeBytesAvailable, PULONGLONG TotalNumberOfBytes,
@@ -1393,9 +1406,16 @@ static NTSTATUS DOKAN_CALLBACK MirrorDokanGetDiskFreeSpace(
   DWORD NumberOfFreeClusters;
   DWORD TotalNumberOfClusters;
   WCHAR DriveLetter[3] = {'C', ':', 0};
-  DriveLetter[0] = RootDirectory[0];
+  PWCHAR RootPathName;
 
-  GetDiskFreeSpace(DriveLetter, &SectorsPerCluster, &BytesPerSector,
+  if (RootDirectory[0] == L'\\') { // UNC as Root
+    RootPathName = RootDirectory;
+  } else {
+    DriveLetter[0] = RootDirectory[0];
+    RootPathName = DriveLetter;
+  }
+
+  GetDiskFreeSpace(RootPathName, &SectorsPerCluster, &BytesPerSector,
                    &NumberOfFreeClusters, &TotalNumberOfClusters);
   *FreeBytesAvailable =
       ((ULONGLONG)SectorsPerCluster) * BytesPerSector * NumberOfFreeClusters;
@@ -1519,6 +1539,7 @@ void ShowUsage() {
           "  /n (use network drive)\t\t\t Show device as network device.\n"
           "  /m (use removable drive)\t\t\t Show device as removable media.\n"
           "  /w (write-protect drive)\t\t\t Read only filesystem.\n"
+          "  /b (case sensitive drive)\t\t\t Supports case-sensitive file names.\n"
           "  /o (use mount manager)\t\t\t Register device to Windows mount manager.\n\t\t\t\t\t\t This enables advanced Windows features like recycle bin and more...\n"
           "  /c (mount for current session only)\t\t Device only visible for current user session.\n"
           "  /u (UNC provider name ex. \\localhost\\myfs)\t UNC name used for network volume.\n"
@@ -1528,7 +1549,8 @@ void ShowUsage() {
           "  /f User mode Lock\t\t\t\t Enable Lockfile/Unlockfile operations. Otherwise Dokan will take care of it.\n"
           "  /e Disable OpLocks\t\t\t\t Disable OpLocks kernel operations. Otherwise Dokan will take care of it.\n"
           "  /i (Timeout in Milliseconds ex. /i 30000)\t Timeout until a running operation is aborted and the device is unmounted.\n"
-          "  /z Optimize single name search\t\t Speed up directory query under Windows 7.\n\n"
+          "  /z Enabled FCB GC. Might speed up on env with filter drivers (Anti-virus) slowing down the system.\n"
+          "  /x (network unmount)\t\t\t Allows unmounting network drive from file explorer\n\n"
           "Examples:\n"
           "\tmirror.exe /r C:\\Users /l M:\t\t\t# Mirror C:\\Users as RootDirectory into a drive of letter M:\\.\n"
           "\tmirror.exe /r C:\\Users /l C:\\mount\\dokan\t# Mirror C:\\Users as RootDirectory into NTFS folder C:\\mount\\dokan.\n"
@@ -1537,50 +1559,54 @@ void ShowUsage() {
   // clang-format on
 }
 
+#define CHECK_CMD_ARG(commad, argc)                                            \
+  {                                                                            \
+    if (++command == argc) {                                                   \
+      fwprintf(stderr, L"Option is missing an argument.\n");                   \
+      return EXIT_FAILURE;                                                     \
+    }                                                                          \
+  }
+
 int __cdecl wmain(ULONG argc, PWCHAR argv[]) {
   int status;
   ULONG command;
-  PDOKAN_OPERATIONS dokanOperations =
-    (PDOKAN_OPERATIONS)malloc(sizeof(DOKAN_OPERATIONS));
-  if (dokanOperations == NULL) {
-    return EXIT_FAILURE;
-  }
-  PDOKAN_OPTIONS dokanOptions = (PDOKAN_OPTIONS)malloc(sizeof(DOKAN_OPTIONS));
-  if (dokanOptions == NULL) {
-    free(dokanOperations);
-    return EXIT_FAILURE;
-  }
+  DOKAN_OPERATIONS dokanOperations;
+  DOKAN_OPTIONS dokanOptions;
 
   if (argc < 3) {
     ShowUsage();
-    free(dokanOperations);
-    free(dokanOptions);
     return EXIT_FAILURE;
   }
 
   g_DebugMode = FALSE;
   g_UseStdErr = FALSE;
+  g_CaseSensitive = FALSE;
 
-  ZeroMemory(dokanOptions, sizeof(DOKAN_OPTIONS));
-  dokanOptions->Version = DOKAN_VERSION;
-  dokanOptions->ThreadCount = 0; // use default
+  ZeroMemory(&dokanOptions, sizeof(DOKAN_OPTIONS));
+  dokanOptions.Version = DOKAN_VERSION;
+  dokanOptions.ThreadCount = 0; // use default
 
   for (command = 1; command < argc; command++) {
     switch (towlower(argv[command][1])) {
     case L'r':
-      command++;
+      CHECK_CMD_ARG(command, argc)
       wcscpy_s(RootDirectory, sizeof(RootDirectory) / sizeof(WCHAR),
                argv[command]);
+      if (!wcslen(RootDirectory)) {
+        DbgPrint(L"Invalid RootDirectory\n");
+        return EXIT_FAILURE;
+      }
+
       DbgPrint(L"RootDirectory: %ls\n", RootDirectory);
       break;
     case L'l':
-      command++;
+      CHECK_CMD_ARG(command, argc)
       wcscpy_s(MountPoint, sizeof(MountPoint) / sizeof(WCHAR), argv[command]);
-      dokanOptions->MountPoint = MountPoint;
+      dokanOptions.MountPoint = MountPoint;
       break;
     case L't':
-      command++;
-      dokanOptions->ThreadCount = (USHORT)_wtoi(argv[command]);
+      CHECK_CMD_ARG(command, argc)
+      dokanOptions.ThreadCount = (USHORT)_wtoi(argv[command]);
       break;
     case L'd':
       g_DebugMode = TRUE;
@@ -1589,87 +1615,87 @@ int __cdecl wmain(ULONG argc, PWCHAR argv[]) {
       g_UseStdErr = TRUE;
       break;
     case L'n':
-      dokanOptions->Options |= DOKAN_OPTION_NETWORK;
+      dokanOptions.Options |= DOKAN_OPTION_NETWORK;
       break;
     case L'm':
-      dokanOptions->Options |= DOKAN_OPTION_REMOVABLE;
+      dokanOptions.Options |= DOKAN_OPTION_REMOVABLE;
       break;
     case L'w':
-      dokanOptions->Options |= DOKAN_OPTION_WRITE_PROTECT;
+      dokanOptions.Options |= DOKAN_OPTION_WRITE_PROTECT;
       break;
     case L'o':
-      dokanOptions->Options |= DOKAN_OPTION_MOUNT_MANAGER;
+      dokanOptions.Options |= DOKAN_OPTION_MOUNT_MANAGER;
       break;
     case L'c':
-      dokanOptions->Options |= DOKAN_OPTION_CURRENT_SESSION;
+      dokanOptions.Options |= DOKAN_OPTION_CURRENT_SESSION;
       break;
     case L'f':
-      dokanOptions->Options |= DOKAN_OPTION_FILELOCK_USER_MODE;
+      dokanOptions.Options |= DOKAN_OPTION_FILELOCK_USER_MODE;
       break;
     case L'e':
-      dokanOptions->Options |= DOKAN_OPTION_DISABLE_OPLOCKS;
+      dokanOptions.Options |= DOKAN_OPTION_DISABLE_OPLOCKS;
       break;
     case L'z':
-      dokanOptions->Options |= DOKAN_OPTION_OPTIMIZE_SINGLE_NAME_SEARCH;
+      dokanOptions.Options |= DOKAN_OPTION_ENABLE_FCB_GARBAGE_COLLECTION;
+      break;
+    case L'x':
+      dokanOptions.Options |= DOKAN_OPTION_ENABLE_UNMOUNT_NETWORK_DRIVE;
+      break;
+    case L'b':
+      // Only work when mirroring a folder with setCaseSensitiveInfo option enabled on win10
+      dokanOptions.Options |= DOKAN_OPTION_CASE_SENSITIVE;
+      g_CaseSensitive = TRUE;
       break;
     case L'u':
-      command++;
+      CHECK_CMD_ARG(command, argc)
       wcscpy_s(UNCName, sizeof(UNCName) / sizeof(WCHAR), argv[command]);
-      dokanOptions->UNCName = UNCName;
+      dokanOptions.UNCName = UNCName;
       DbgPrint(L"UNC Name: %ls\n", UNCName);
       break;
     case L'p':
       g_ImpersonateCallerUser = TRUE;
       break;
     case L'i':
-      command++;
-      dokanOptions->Timeout = (ULONG)_wtol(argv[command]);
+      CHECK_CMD_ARG(command, argc)
+      dokanOptions.Timeout = (ULONG)_wtol(argv[command]);
       break;
     case L'a':
-      command++;
-      dokanOptions->AllocationUnitSize = (ULONG)_wtol(argv[command]);
+      CHECK_CMD_ARG(command, argc)
+      dokanOptions.AllocationUnitSize = (ULONG)_wtol(argv[command]);
       break;
     case L'k':
-      command++;
-      dokanOptions->SectorSize = (ULONG)_wtol(argv[command]);
+      CHECK_CMD_ARG(command, argc)
+      dokanOptions.SectorSize = (ULONG)_wtol(argv[command]);
       break;
     default:
-      fwprintf(stderr, L"unknown command: %s\n", argv[command]);
-      free(dokanOperations);
-      free(dokanOptions);
+      fwprintf(stderr, L"unknown command: %ls\n", argv[command]);
       return EXIT_FAILURE;
     }
   }
 
   if (wcscmp(UNCName, L"") != 0 &&
-      !(dokanOptions->Options & DOKAN_OPTION_NETWORK)) {
+      !(dokanOptions.Options & DOKAN_OPTION_NETWORK)) {
     fwprintf(
              stderr,
              L"  Warning: UNC provider name should be set on network drive only.\n");
   }
 
-  if (dokanOptions->Options & DOKAN_OPTION_NETWORK &&
-      dokanOptions->Options & DOKAN_OPTION_MOUNT_MANAGER) {
+  if (dokanOptions.Options & DOKAN_OPTION_NETWORK &&
+      dokanOptions.Options & DOKAN_OPTION_MOUNT_MANAGER) {
     fwprintf(stderr, L"Mount manager cannot be used on network drive.\n");
-    free(dokanOperations);
-    free(dokanOptions);
     return EXIT_FAILURE;
   }
 
-  if (!(dokanOptions->Options & DOKAN_OPTION_MOUNT_MANAGER) &&
+  if (!(dokanOptions.Options & DOKAN_OPTION_MOUNT_MANAGER) &&
       wcscmp(MountPoint, L"") == 0) {
     fwprintf(stderr, L"Mount Point required.\n");
-    free(dokanOperations);
-    free(dokanOptions);
     return EXIT_FAILURE;
   }
 
-  if ((dokanOptions->Options & DOKAN_OPTION_MOUNT_MANAGER) &&
-      (dokanOptions->Options & DOKAN_OPTION_CURRENT_SESSION)) {
+  if ((dokanOptions.Options & DOKAN_OPTION_MOUNT_MANAGER) &&
+      (dokanOptions.Options & DOKAN_OPTION_CURRENT_SESSION)) {
     fwprintf(stderr,
              L"Mount Manager always mount the drive for all user sessions.\n");
-    free(dokanOperations);
-    free(dokanOptions);
     return EXIT_FAILURE;
   }
 
@@ -1681,58 +1707,57 @@ int __cdecl wmain(ULONG argc, PWCHAR argv[]) {
   // properly.
   g_HasSeSecurityPrivilege = AddSeSecurityNamePrivilege();
   if (!g_HasSeSecurityPrivilege) {
-    fwprintf(stderr, L"Failed to add security privilege to process\n");
     fwprintf(stderr,
-             L"\t=> GetFileSecurity/SetFileSecurity may not work properly\n");
-    fwprintf(stderr, L"\t=> Please restart mirror sample with administrator "
-             L"rights to fix it\n");
+             L"[Mirror] Failed to add security privilege to process\n"
+             L"\t=> GetFileSecurity/SetFileSecurity may not work properly\n"
+             L"\t=> Please restart mirror sample with administrator rights to fix it\n");
   }
 
   if (g_ImpersonateCallerUser && !g_HasSeSecurityPrivilege) {
-    fwprintf(stderr, L"Impersonate Caller User requires administrator right to "
-             L"work properly\n");
-    fwprintf(stderr, L"\t=> Other users may not use the drive properly\n");
-    fwprintf(stderr, L"\t=> Please restart mirror sample with administrator "
-             L"rights to fix it\n");
+    fwprintf(
+        stderr,
+        L"[Mirror] Impersonate Caller User requires administrator right to work properly\n"
+        L"\t=> Other users may not use the drive properly\n"
+        L"\t=> Please restart mirror sample with administrator rights to fix it\n");
   }
 
   if (g_DebugMode) {
-    dokanOptions->Options |= DOKAN_OPTION_DEBUG;
+    dokanOptions.Options |= DOKAN_OPTION_DEBUG;
   }
   if (g_UseStdErr) {
-    dokanOptions->Options |= DOKAN_OPTION_STDERR;
+    dokanOptions.Options |= DOKAN_OPTION_STDERR;
   }
 
-  dokanOptions->Options |= DOKAN_OPTION_ALT_STREAM;
+  dokanOptions.Options |= DOKAN_OPTION_ALT_STREAM;
 
-  ZeroMemory(dokanOperations, sizeof(DOKAN_OPERATIONS));
-  dokanOperations->ZwCreateFile = MirrorCreateFile;
-  dokanOperations->Cleanup = MirrorCleanup;
-  dokanOperations->CloseFile = MirrorCloseFile;
-  dokanOperations->ReadFile = MirrorReadFile;
-  dokanOperations->WriteFile = MirrorWriteFile;
-  dokanOperations->FlushFileBuffers = MirrorFlushFileBuffers;
-  dokanOperations->GetFileInformation = MirrorGetFileInformation;
-  dokanOperations->FindFiles = MirrorFindFiles;
-  dokanOperations->FindFilesWithPattern = NULL;
-  dokanOperations->SetFileAttributes = MirrorSetFileAttributes;
-  dokanOperations->SetFileTime = MirrorSetFileTime;
-  dokanOperations->DeleteFile = MirrorDeleteFile;
-  dokanOperations->DeleteDirectory = MirrorDeleteDirectory;
-  dokanOperations->MoveFile = MirrorMoveFile;
-  dokanOperations->SetEndOfFile = MirrorSetEndOfFile;
-  dokanOperations->SetAllocationSize = MirrorSetAllocationSize;
-  dokanOperations->LockFile = MirrorLockFile;
-  dokanOperations->UnlockFile = MirrorUnlockFile;
-  dokanOperations->GetFileSecurity = MirrorGetFileSecurity;
-  dokanOperations->SetFileSecurity = MirrorSetFileSecurity;
-  dokanOperations->GetDiskFreeSpace = MirrorDokanGetDiskFreeSpace;
-  dokanOperations->GetVolumeInformation = MirrorGetVolumeInformation;
-  dokanOperations->Unmounted = MirrorUnmounted;
-  dokanOperations->FindStreams = MirrorFindStreams;
-  dokanOperations->Mounted = MirrorMounted;
+  ZeroMemory(&dokanOperations, sizeof(DOKAN_OPERATIONS));
+  dokanOperations.ZwCreateFile = MirrorCreateFile;
+  dokanOperations.Cleanup = MirrorCleanup;
+  dokanOperations.CloseFile = MirrorCloseFile;
+  dokanOperations.ReadFile = MirrorReadFile;
+  dokanOperations.WriteFile = MirrorWriteFile;
+  dokanOperations.FlushFileBuffers = MirrorFlushFileBuffers;
+  dokanOperations.GetFileInformation = MirrorGetFileInformation;
+  dokanOperations.FindFiles = MirrorFindFiles;
+  dokanOperations.FindFilesWithPattern = NULL;
+  dokanOperations.SetFileAttributes = MirrorSetFileAttributes;
+  dokanOperations.SetFileTime = MirrorSetFileTime;
+  dokanOperations.DeleteFile = MirrorDeleteFile;
+  dokanOperations.DeleteDirectory = MirrorDeleteDirectory;
+  dokanOperations.MoveFile = MirrorMoveFile;
+  dokanOperations.SetEndOfFile = MirrorSetEndOfFile;
+  dokanOperations.SetAllocationSize = MirrorSetAllocationSize;
+  dokanOperations.LockFile = MirrorLockFile;
+  dokanOperations.UnlockFile = MirrorUnlockFile;
+  dokanOperations.GetFileSecurity = MirrorGetFileSecurity;
+  dokanOperations.SetFileSecurity = MirrorSetFileSecurity;
+  dokanOperations.GetDiskFreeSpace = MirrorDokanGetDiskFreeSpace;
+  dokanOperations.GetVolumeInformation = MirrorGetVolumeInformation;
+  dokanOperations.Unmounted = MirrorUnmounted;
+  dokanOperations.FindStreams = MirrorFindStreams;
+  dokanOperations.Mounted = MirrorMounted;
 
-  status = DokanMain(dokanOptions, dokanOperations);
+  status = DokanMain(&dokanOptions, &dokanOperations);
   switch (status) {
   case DOKAN_SUCCESS:
     fprintf(stderr, "Success\n");
@@ -1762,8 +1787,5 @@ int __cdecl wmain(ULONG argc, PWCHAR argv[]) {
     fprintf(stderr, "Unknown error: %d\n", status);
     break;
   }
-
-  free(dokanOptions);
-  free(dokanOperations);
   return EXIT_SUCCESS;
 }
